@@ -1,10 +1,13 @@
 import streamlit as st 
 
 from app.ui import pdf_uploader
-from app.chat_utils import get_chat_model,ask_chat_model
+from app.pdf_utils import extract_text_from_pdf, clean_text
+from io import BytesIO
+from app.s3_utils import process_uploaded_files, list_s3_documents, download_from_s3
 #from app.config import EURI_API_KEY
-from app.pdf_utils import load_documents_from_pdfs,get_document_chunks
-from app.vectorstore_utils import create_faiss_index,retrieve_relevant_docs
+from app.vectorstore_utils import create_chroma_collection, retrieve_relevant_docs, clear_chroma_collection
+from app.chat_utils import get_chat_model, ask_chat_model
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import os 
 from dotenv import load_dotenv
 load_dotenv()
@@ -119,6 +122,19 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# Helper functions
+def get_document_chunks(texts):
+    """Split documents into chunks for vectorstore"""
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
+    )
+    chunks = []
+    for text in texts:
+        text_chunks = text_splitter.split_text(text)
+        chunks.extend(text_chunks)
+    return chunks
 
 # --- APP LAYOUT ---
 
@@ -139,14 +155,119 @@ with st.sidebar:
         st.markdown('<div class="sidebar-box">', unsafe_allow_html=True)
         if st.button("⚙️ Process Documents", type="primary"):
             with st.spinner("🔄 Processing your medical documents..."):
-                all_documents = load_documents_from_pdfs(uploaded_files)
-                documents = get_document_chunks(all_documents)
-                vectorstore = create_faiss_index(documents)
-                st.session_state.vectorstore = vectorstore
-                chat_model = get_chat_model(EURI_API_KEY)
-                st.session_state.chat_model = chat_model
-                st.success("✅ Processing complete! Ready for questions.")
+                # Process files: extract text and upload to S3
+                process_results = process_uploaded_files(uploaded_files, extract_text_from_pdf)
+                
+                # Show S3 upload status
+                if process_results["uploaded"]:
+                    st.success(f"✅ {len(process_results['uploaded'])} file(s) uploaded to S3")
+                    for item in process_results["uploaded"]:
+                        st.info(f"📄 {item['filename']} → S3: {item['s3_key']}")
+                
+                if process_results["failed"]:
+                    st.warning(f"⚠️ {len(process_results['failed'])} file(s) failed to upload")
+                    for item in process_results["failed"]:
+                        st.error(f"❌ {item['filename']}: {item.get('error', 'Unknown error')}")
+                
+                # Process texts for ChromaDB
+                if process_results["texts"]:
+                    documents = get_document_chunks(process_results["texts"])
+                    collection = create_chroma_collection(documents)
+                    st.session_state.collection = collection
+                    chat_model = get_chat_model(EURI_API_KEY)
+                    st.session_state.chat_model = chat_model
+                    st.success("✅ Processing complete! Ready for questions.")
+                else:
+                    st.error("❌ No text could be extracted from the uploaded files.")
         st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Show existing S3 documents
+        st.markdown('<div class="sidebar-box">', unsafe_allow_html=True)
+        if st.button("📋 List S3 Documents"):
+            s3_docs = list_s3_documents()
+            if s3_docs:
+                st.write(f"**Found {len(s3_docs)} document(s) in S3:**")
+                for doc in s3_docs:
+                    st.write(f"📄 {doc['filename']} ({doc['size']} bytes)")
+            else:
+                st.info("No documents found in S3.")
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    # S3 IMPORT SECTION
+    st.markdown('<div class="sidebar-box">', unsafe_allow_html=True)
+    st.header("☁️ Import from S3")
+    st.markdown("📥 **Import documents from your S3 bucket:**")
+    
+    if st.button("🔄 Load S3 Files", type="secondary"):
+        with st.spinner("🔄 Loading files from S3..."):
+            s3_docs = list_s3_documents()
+            if s3_docs:
+                st.session_state.s3_documents = s3_docs
+                st.success(f"✅ Found {len(s3_docs)} file(s) in S3")
+            else:
+                st.session_state.s3_documents = []
+                st.warning("⚠️ No documents found in S3 bucket.")
+    
+    # Display S3 files and allow selection
+    if "s3_documents" in st.session_state and st.session_state.s3_documents:
+        st.markdown("**Select files to import:**")
+        
+        # Create a list of file options for selection
+        file_options = [f"{doc['filename']} ({doc['size']} bytes)" for doc in st.session_state.s3_documents]
+        selected_indices = st.multiselect(
+            "Choose files to import:",
+            options=range(len(file_options)),
+            format_func=lambda x: file_options[x],
+            key="s3_file_selection"
+        )
+        
+        if selected_indices:
+            if st.button("⬇️ Import Selected Files", type="primary"):
+                with st.spinner("🔄 Importing and processing files from S3..."):
+                    imported_texts = []
+                    imported_count = 0
+                    failed_count = 0
+                    
+                    for idx in selected_indices:
+                        doc = st.session_state.s3_documents[idx]
+                        s3_key = doc["key"]
+                        
+                        # Download file from S3
+                        download_result = download_from_s3(s3_key)
+                        
+                        if download_result["success"]:
+                            try:
+                                # Extract text from downloaded PDF
+                                file_bytes = download_result["content"]
+                                text = extract_text_from_pdf(BytesIO(file_bytes))
+                                
+                                if text:
+                                    imported_texts.append(text)
+                                    imported_count += 1
+                                    st.success(f"✅ Imported: {doc['filename']}")
+                                else:
+                                    st.warning(f"⚠️ No text extracted from: {doc['filename']}")
+                                    failed_count += 1
+                            except Exception as e:
+                                st.error(f"❌ Error processing {doc['filename']}: {str(e)}")
+                                failed_count += 1
+                        else:
+                            st.error(f"❌ Failed to download {doc['filename']}: {download_result.get('error', 'Unknown error')}")
+                            failed_count += 1
+                    
+                    # Process imported texts for ChromaDB
+                    if imported_texts:
+                        documents = get_document_chunks(imported_texts)
+                        collection = create_chroma_collection(documents)
+                        st.session_state.collection = collection
+                        chat_model = get_chat_model(EURI_API_KEY)
+                        st.session_state.chat_model = chat_model
+                        st.success(f"✅ Successfully imported and processed {imported_count} file(s)! Ready for questions.")
+                        if failed_count > 0:
+                            st.warning(f"⚠️ {failed_count} file(s) failed to import.")
+                    else:
+                        st.error("❌ No files could be imported successfully.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
                 
                 
@@ -165,10 +286,12 @@ st.markdown("### Chat with your Medical documents")
 # 1.INITIALIZE SESSION STATE
 if "messages" not in st.session_state:
     st.session_state.messages=[]
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore=None
+if "collection" not in st.session_state:
+    st.session_state.collection=None
 if "chat_model" not in st.session_state:
     st.session_state.chat_model=None
+if "s3_documents" not in st.session_state:
+    st.session_state.s3_documents=[]
 
 ## Sidebar Button to Clear Chat 
 st.sidebar.title("Controls")
@@ -197,11 +320,11 @@ if prompt := st.chat_input("Ask about your medical documents..."):
         st.markdown(prompt)
 
     #Check if documents have been uploaded before responding
-    if st.session_state.vectorstore:
+    if st.session_state.collection:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 #RAG PIEPLINE
-                context_docs=retrieve_relevant_docs(st.session_state.vectorstore, prompt)
+                context_docs=retrieve_relevant_docs(prompt, k=4)
 
                 # Handle no relevant context ---
                 if context_docs:
