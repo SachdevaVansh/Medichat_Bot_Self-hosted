@@ -25,7 +25,7 @@ def load_documents_from_pdfs(pdf_files):
                 temp_file.write(pdf_file.getvalue())
                 temp_file_path=temp_file.name
 
-            #Use a PDFLoadr to load the temporary files 
+            #Use a PDFLoader to load the temporary files 
             loader=PyPDFLoader(temp_file_path)
             documents=loader.load()
             all_documents.extend(documents)# Add the documents from the current PDF to the list
